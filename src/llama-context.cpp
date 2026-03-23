@@ -87,7 +87,73 @@ static void llama_selective_expert_load_random(const llama_model & model, int pe
         if (l.ffn_up_exps)    tensors.push_back(l.ffn_up_exps);
         if (l.ffn_down_exps)  tensors.push_back(l.ffn_down_exps);
         for (ggml_tensor * t : tensors) {
-            if (!t || !ggml_backend_buffer_is_host(t->buffer)) continue;
+            if (!t || !t->data || !ggml_backend_buffer_is_host(t->buffer)) continue;
+            const size_t expert_stride = t->nb[2];
+            const int    n_experts     = (int)t->ne[2];
+            std::vector<char> host_buf(ggml_nbytes(t));
+            ggml_backend_tensor_get(t, host_buf.data(), 0, host_buf.size());
+            std::lock_guard<std::mutex> lk(g_expert_ptr_tables_mu);
+            auto & table = g_expert_ptr_tables[t];
+            if ((int)table.ptrs.size() != n_experts) {
+                table.ptrs.assign(n_experts, nullptr);
+                table.owns.assign(n_experts, 0);
+            }
+            table.n_experts = n_experts;
+            g_expert_ptr_tensor_by_name[t->name] = t;
+            for (int eid : hot_ids) {
+                if (eid < 0 || eid >= n_experts || table.ptrs[eid]) continue;
+                void * gpu_ptr = nullptr;
+                if (cudaMalloc(&gpu_ptr, expert_stride) != cudaSuccess) continue;
+                cudaMemcpy(gpu_ptr, host_buf.data() + (size_t)eid * expert_stride, expert_stride, cudaMemcpyHostToDevice);
+                table.ptrs[eid] = gpu_ptr;
+                table.owns[eid] = 1;
+                total_gpu_bytes += expert_stride; total_hot++;
+            }
+            if (!table.d_ptrs) cudaMalloc(&table.d_ptrs, n_experts * sizeof(void *));
+            cudaMemcpy(table.d_ptrs, table.ptrs.data(), n_experts * sizeof(void *), cudaMemcpyHostToDevice);
+            g_expert_d_ptr_cache[t] = table.d_ptrs;
+        }
+    }
+    LLAMA_LOG_INFO("%s: loaded %d hot expert slices to GPU (%.1f MiB)\n",
+        __func__, total_hot, total_gpu_bytes / 1024.0 / 1024.0);
+#endif
+}
+
+static void llama_selective_expert_load_profile(const llama_model & model, const char * profile_path) {
+#ifndef GGML_USE_CUDA
+    LLAMA_LOG_WARN("%s: CUDA not available, --hot-expert-profile ignored\n", __func__);
+    (void)model; (void)profile_path;
+#else
+    // Parse profile: lines of "<layer> <eid0> <eid1> ..."  (# = comment)
+    std::unordered_map<int, std::vector<int>> hot_sets;
+    std::ifstream f(profile_path);
+    if (!f) {
+        LLAMA_LOG_WARN("%s: cannot open profile '%s'\n", __func__, profile_path);
+        return;
+    }
+    std::string line;
+    while (std::getline(f, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        std::istringstream ss(line);
+        int layer; ss >> layer;
+        int eid;
+        while (ss >> eid) hot_sets[layer].push_back(eid);
+    }
+    LLAMA_LOG_INFO("%s: loaded profile '%s' (%zu layers)\n", __func__, profile_path, hot_sets.size());
+
+    llama_clear_expert_ptr_tables();
+    size_t total_gpu_bytes = 0; int total_hot = 0;
+    for (int il = 0; il < (int)model.layers.size(); ++il) {
+        auto it = hot_sets.find(il);
+        if (it == hot_sets.end()) continue;
+        const auto & hot_ids = it->second;
+        auto & l = model.layers[il];
+        std::vector<ggml_tensor *> tensors;
+        if (l.ffn_gate_exps)  tensors.push_back(l.ffn_gate_exps);
+        if (l.ffn_up_exps)    tensors.push_back(l.ffn_up_exps);
+        if (l.ffn_down_exps)  tensors.push_back(l.ffn_down_exps);
+        for (ggml_tensor * t : tensors) {
+            if (!t || !t->data || !ggml_backend_buffer_is_host(t->buffer)) continue;
             const size_t expert_stride = t->nb[2];
             const int    n_experts     = (int)t->ne[2];
             std::vector<char> host_buf(ggml_nbytes(t));
@@ -364,6 +430,9 @@ llama_context::llama_context(
 
         if (params.hot_expert_percent > 0) {
             llama_selective_expert_load_random(model, params.hot_expert_percent);
+        }
+        if (params.hot_expert_profile && params.hot_expert_profile[0] != '\0') {
+            llama_selective_expert_load_profile(model, params.hot_expert_profile);
         }
 
         // graph outputs buffer
