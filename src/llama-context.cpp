@@ -14,6 +14,110 @@
 #include <cstring>
 #include <limits>
 #include <stdexcept>
+#include <algorithm>
+#include <fstream>
+#include <mutex>
+#include <numeric>
+#include <random>
+#include <sstream>
+#include <unordered_map>
+
+#ifdef GGML_USE_CUDA
+#include <cuda_runtime.h>
+
+struct ExpertPtrTable {
+    std::vector<void *> ptrs;
+    std::vector<int>    owns;
+    void ** d_ptrs    = nullptr;
+    int     n_experts = 0;
+};
+static std::unordered_map<const ggml_tensor *, ExpertPtrTable> g_expert_ptr_tables;
+static std::unordered_map<const ggml_tensor *, void **>         g_expert_d_ptr_cache;
+static std::unordered_map<std::string, const ggml_tensor *>     g_expert_ptr_tensor_by_name;
+static std::mutex                                                g_expert_ptr_tables_mu;
+
+static void llama_clear_expert_ptr_tables() {
+    std::lock_guard<std::mutex> lk(g_expert_ptr_tables_mu);
+    for (auto & kv : g_expert_ptr_tables) {
+        auto & table = kv.second;
+        for (void * ptr : table.ptrs) { if (ptr) cudaFree(ptr); }
+        if (table.d_ptrs) { cudaFree(table.d_ptrs); table.d_ptrs = nullptr; }
+        table.ptrs.clear(); table.n_experts = 0;
+    }
+    g_expert_ptr_tables.clear();
+    g_expert_d_ptr_cache.clear();
+}
+
+extern "C" void ** llama_get_expert_d_ptrs(const ggml_tensor * tensor) {
+    auto it = g_expert_d_ptr_cache.find(tensor);
+    return (it != g_expert_d_ptr_cache.end()) ? it->second : nullptr;
+}
+#endif // GGML_USE_CUDA
+
+static void llama_selective_expert_load_random(const llama_model & model, int percent) {
+#ifndef GGML_USE_CUDA
+    LLAMA_LOG_WARN("%s: CUDA not available, --hot-expert-percent ignored\n", __func__);
+    (void)model; (void)percent;
+#else
+    llama_clear_expert_ptr_tables();
+    std::unordered_map<int, std::vector<int>> hot_sets;
+    std::mt19937 rng(12345);
+    for (int il = 0; il < (int)model.layers.size(); ++il) {
+        auto & l = model.layers[il];
+        int n_experts = 0;
+        if (l.ffn_gate_exps)      n_experts = (int)l.ffn_gate_exps->ne[2];
+        else if (l.ffn_up_exps)   n_experts = (int)l.ffn_up_exps->ne[2];
+        else if (l.ffn_down_exps) n_experts = (int)l.ffn_down_exps->ne[2];
+        if (n_experts == 0) continue;
+        int n_load = std::max(1, (n_experts * percent) / 100);
+        std::vector<int> all(n_experts);
+        std::iota(all.begin(), all.end(), 0);
+        std::shuffle(all.begin(), all.end(), rng);
+        hot_sets[il].assign(all.begin(), all.begin() + n_load);
+    }
+    LLAMA_LOG_INFO("%s: randomly selected %d%% of experts per layer\n", __func__, percent);
+    size_t total_gpu_bytes = 0; int total_hot = 0;
+    for (int il = 0; il < (int)model.layers.size(); ++il) {
+        auto & l = model.layers[il];
+        auto it = hot_sets.find(il);
+        if (it == hot_sets.end()) continue;
+        const auto & hot_ids = it->second;
+        std::vector<ggml_tensor *> tensors;
+        if (l.ffn_gate_exps)  tensors.push_back(l.ffn_gate_exps);
+        if (l.ffn_up_exps)    tensors.push_back(l.ffn_up_exps);
+        if (l.ffn_down_exps)  tensors.push_back(l.ffn_down_exps);
+        for (ggml_tensor * t : tensors) {
+            if (!t || !ggml_backend_buffer_is_host(t->buffer)) continue;
+            const size_t expert_stride = t->nb[2];
+            const int    n_experts     = (int)t->ne[2];
+            std::vector<char> host_buf(ggml_nbytes(t));
+            ggml_backend_tensor_get(t, host_buf.data(), 0, host_buf.size());
+            std::lock_guard<std::mutex> lk(g_expert_ptr_tables_mu);
+            auto & table = g_expert_ptr_tables[t];
+            if ((int)table.ptrs.size() != n_experts) {
+                table.ptrs.assign(n_experts, nullptr);
+                table.owns.assign(n_experts, 0);
+            }
+            table.n_experts = n_experts;
+            g_expert_ptr_tensor_by_name[t->name] = t;
+            for (int eid : hot_ids) {
+                if (eid < 0 || eid >= n_experts || table.ptrs[eid]) continue;
+                void * gpu_ptr = nullptr;
+                if (cudaMalloc(&gpu_ptr, expert_stride) != cudaSuccess) continue;
+                cudaMemcpy(gpu_ptr, host_buf.data() + (size_t)eid * expert_stride, expert_stride, cudaMemcpyHostToDevice);
+                table.ptrs[eid] = gpu_ptr;
+                table.owns[eid] = 1;
+                total_gpu_bytes += expert_stride; total_hot++;
+            }
+            if (!table.d_ptrs) cudaMalloc(&table.d_ptrs, n_experts * sizeof(void *));
+            cudaMemcpy(table.d_ptrs, table.ptrs.data(), n_experts * sizeof(void *), cudaMemcpyHostToDevice);
+            g_expert_d_ptr_cache[t] = table.d_ptrs;
+        }
+    }
+    LLAMA_LOG_INFO("%s: loaded %d hot expert slices to GPU (%.1f MiB)\n",
+        __func__, total_hot, total_gpu_bytes / 1024.0 / 1024.0);
+#endif
+}
 
 //
 // llama_context
@@ -257,6 +361,10 @@ llama_context::llama_context(
         }
 
         llama_set_abort_callback(this, params.abort_callback, params.abort_callback_data);
+
+        if (params.hot_expert_percent > 0) {
+            llama_selective_expert_load_random(model, params.hot_expert_percent);
+        }
 
         // graph outputs buffer
         {
@@ -2907,6 +3015,8 @@ llama_context_params llama_context_default_params() {
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
+        /*.hot_expert_profile          =*/ nullptr,
+        /*.hot_expert_percent          =*/ 0,
         /*.embeddings                  =*/ false,
         /*.offload_kqv                 =*/ true,
         /*.no_perf                     =*/ true,

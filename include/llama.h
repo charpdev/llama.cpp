@@ -361,6 +361,9 @@ extern "C" {
         ggml_abort_callback abort_callback;
         void *              abort_callback_data;
 
+        const char *        hot_expert_profile;  // path to hot-expert profile for selective GPU loading (nullptr = disabled)
+        int32_t             hot_expert_percent;  // randomly load N% of experts per layer (0 = disabled, 1-100)
+
         // Keep the booleans together and at the end of the struct to avoid misalignment during copy-by-value.
         bool embeddings;  // if true, extract embeddings (together with logits)
         bool offload_kqv; // offload the KQV ops (including the KV cache) to GPU

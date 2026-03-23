@@ -2323,6 +2323,25 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
         }
     ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_N_CPU_MOE_DRAFT"));
+    add_opt(common_arg(
+        {"--hot-expert-profile"}, "FILE",
+        "path to hot-expert profile for selective expert GPU loading (requires --cpu-moe)",
+        [](common_params & params, const std::string & value) {
+            params.hot_expert_profile = value;
+            params.tensor_buft_overrides.push_back(llm_ffn_exps_cpu_override());
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--hot-expert-percent"}, "N",
+        "randomly load N% of experts per layer to GPU (1-100), no profile needed (requires --cpu-moe)",
+        [](common_params & params, const int value) {
+            if (value < 1 || value > 100) {
+                throw std::invalid_argument("--hot-expert-percent must be between 1 and 100");
+            }
+            params.hot_expert_percent = value;
+            params.tensor_buft_overrides.push_back(llm_ffn_exps_cpu_override());
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     GGML_ASSERT(params.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0
     add_opt(common_arg(
         {"-ngl", "--gpu-layers", "--n-gpu-layers"}, "N",
