@@ -3,6 +3,10 @@
 #include "llama-arch.h"
 #include "llama-impl.h"
 #include "llama-batch.h"
+
+extern "C" {
+#include "../ggml/src/tq_quants.h"
+}
 #include "llama-io.h"
 #include "llama-memory.h"
 #include "llama-mmap.h"
@@ -272,6 +276,11 @@ llama_context::llama_context(
 
     // init the memory module
     if (!hparams.vocab_only) {
+        // initialize TurboQuant rotation if tq4_0 KV cache is requested
+        if (params.type_k == GGML_TYPE_TQ4_0 || params.type_v == GGML_TYPE_TQ4_0) {
+            tq_init(hparams.n_embd_head_k_full, 42);
+        }
+
         llama_memory_params params_mem = {
             /*.type_k   =*/ params.type_k,
             /*.type_v   =*/ params.type_v,
