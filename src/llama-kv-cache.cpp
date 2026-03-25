@@ -1,4 +1,5 @@
 #include "llama-kv-cache.h"
+#include "kv-rotation.h"
 
 #include "llama-impl.h"
 #include "llama-io.h"
@@ -178,6 +179,23 @@ llama_kv_cache::llama_kv_cache(
         }
     }
 
+    // allocate KV cache rotation matrix if requested via LLAMA_KV_ROTATION=1
+    const char * kv_rot_env = getenv("LLAMA_KV_ROTATION");
+    if (kv_rot_env && atoi(kv_rot_env) && !model.hparams.no_alloc && !layers.empty()) {
+        const int d = hparams.n_embd_head_k_full;
+        // use the same buffer type as the first KV layer
+        ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
+        if (offload) {
+            auto * dev = model.dev_layer(layers[0].il);
+            buft = ggml_backend_dev_buffer_type(dev);
+        }
+        ggml_context * ctx = ctx_for_buft(buft);
+        kv_rotation = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d, d);
+        ggml_set_name(kv_rotation, "kv_rotation");
+        LLAMA_LOG_INFO("%s: KV cache rotation enabled (head_dim=%d, %.2f MiB)\n",
+                __func__, d, (float)(d * d * sizeof(float)) / (1024.0f * 1024.0f));
+    }
+
     // allocate tensors and initialize the buffers to avoid NaNs in the padding
     for (auto & [buft, ctx] : ctx_map) {
         ggml_backend_buffer_t buf;
@@ -197,6 +215,16 @@ llama_kv_cache::llama_kv_cache(
 
         ggml_backend_buffer_clear(buf, 0);
         ctxs_bufs.emplace_back(std::move(ctx), buf);
+    }
+
+    // fill rotation matrix data
+    if (kv_rotation && kv_rotation->buffer) {
+        const int d = hparams.n_embd_head_k_full;
+        float * rot = kv_rotation_generate(d, 42);
+        if (rot) {
+            ggml_backend_tensor_set(kv_rotation, rot, 0, d * d * sizeof(float));
+            free(rot);
+        }
     }
 
     {
@@ -1104,6 +1132,14 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
     }
 
     // store the current K values into the cache
+    // apply rotation before quantization if enabled
+    if (kv_rotation) {
+        const int64_t d = kv_rotation->ne[0];
+        const int64_t n = ggml_nelements(k_cur) / d;
+        ggml_tensor * k_2d = ggml_reshape_2d(ctx, k_cur, d, n);
+        k_2d = ggml_mul_mat(ctx, kv_rotation, k_2d);
+        k_cur = ggml_reshape_2d(ctx, k_2d, n_embd_gqa, ggml_nelements(k_2d) / n_embd_gqa);
+    }
     return ggml_set_rows(ctx, k, k_cur, k_idxs);
 }
 
@@ -2254,6 +2290,10 @@ ggml_tensor * llama_kv_cache_context::cpy_k(ggml_context * ctx, ggml_tensor * k_
 
 ggml_tensor * llama_kv_cache_context::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il) const {
     return kv->cpy_v(ctx, v_cur, v_idxs, il, sinfos[i_cur]);
+}
+
+ggml_tensor * llama_kv_cache_context::get_kv_rotation() const {
+    return kv->get_kv_rotation();
 }
 
 ggml_tensor * llama_kv_cache_context::build_input_k_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const {
