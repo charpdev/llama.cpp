@@ -199,6 +199,8 @@ public:
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
+    ggml_tensor * get_tq_rotation() const { return tq_rotation; }
+
 private:
     const llama_model & model;
     const llama_hparams & hparams;
@@ -216,6 +218,10 @@ private:
     };
 
     bool v_trans = true;  // the value tensor is transposed
+
+    // TurboQuant rotation matrix (head_dim x head_dim, F32)
+    // allocated on same device as KV cache when type_k == TQ4_0
+    ggml_tensor * tq_rotation = nullptr;
 
     const uint32_t n_seq_max = 1;
     const uint32_t n_stream  = 1;
@@ -353,6 +359,9 @@ public:
     void set_input_k_shift   (ggml_tensor * dst) const;
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+
+    // TurboQuant rotation matrix (or nullptr if not using TQ4_0)
+    ggml_tensor * get_tq_rotation() const;
 
 private:
     llama_memory_status status;

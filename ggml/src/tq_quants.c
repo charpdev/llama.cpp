@@ -120,6 +120,14 @@ void tq_cleanup(void) {
     g_head_dim = 0;
 }
 
+float * tq_get_rotation(void) {
+    return g_rotation;
+}
+
+int tq_get_head_dim(void) {
+    return g_head_dim;
+}
+
 /* rotate one head: out[i] = sum_j R[i][j] * x[j] */
 static void rotate_head(const float * x, float * out, const float * R, int d) {
     for (int i = 0; i < d; i++) {

@@ -8,6 +8,10 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+
+extern "C" {
+    float * tq_get_rotation(void);
+}
 #include <cstring>
 #include <limits>
 #include <map>
@@ -178,6 +182,20 @@ llama_kv_cache::llama_kv_cache(
         }
     }
 
+    // allocate TurboQuant rotation matrix if needed
+    if (type_k == GGML_TYPE_TQ4_0) {
+        const int d = hparams.n_embd_head_k_full;
+        // use the same buft as the first KV layer
+        ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
+        if (offload && !layers.empty()) {
+            auto * dev = model.dev_layer(layers[0].il);
+            buft = ggml_backend_dev_buffer_type(dev);
+        }
+        ggml_context * ctx = ctx_for_buft(buft);
+        tq_rotation = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d, d);
+        ggml_set_name(tq_rotation, "tq_rotation");
+    }
+
     // allocate tensors and initialize the buffers to avoid NaNs in the padding
     for (auto & [buft, ctx] : ctx_map) {
         ggml_backend_buffer_t buf;
@@ -197,6 +215,15 @@ llama_kv_cache::llama_kv_cache(
 
         ggml_backend_buffer_clear(buf, 0);
         ctxs_bufs.emplace_back(std::move(ctx), buf);
+    }
+
+    // initialize TurboQuant rotation matrix data
+    if (tq_rotation && tq_rotation->buffer) {
+        float * rot = tq_get_rotation();
+        if (rot) {
+            const int d = hparams.n_embd_head_k_full;
+            ggml_backend_tensor_set(tq_rotation, rot, 0, d * d * sizeof(float));
+        }
     }
 
     {
@@ -1104,6 +1131,18 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
     }
 
     // store the current K values into the cache
+    // TQ4_0: apply rotation before quantization
+    if (tq_rotation && k->type == GGML_TYPE_TQ4_0) {
+        const int64_t d = tq_rotation->ne[0];
+        const int64_t n = ggml_nelements(k_cur) / d;
+        // reshape to [head_dim, n_head*n_tokens], rotate, reshape back
+        ggml_tensor * k_2d = ggml_reshape_2d(ctx, k_cur, d, n);
+        // ggml_mul_mat(A, B) computes A^T * B
+        // we want R * k_2d, so pass R^T: ggml_mul_mat(R^T, k_2d) = R * k_2d
+        ggml_tensor * Rt = ggml_transpose(ctx, tq_rotation);
+        k_2d = ggml_mul_mat(ctx, Rt, k_2d);
+        k_cur = ggml_reshape_2d(ctx, k_2d, n_embd_gqa, ggml_nelements(k_2d) / n_embd_gqa);
+    }
     return ggml_set_rows(ctx, k, k_cur, k_idxs);
 }
 
@@ -2254,6 +2293,10 @@ ggml_tensor * llama_kv_cache_context::cpy_k(ggml_context * ctx, ggml_tensor * k_
 
 ggml_tensor * llama_kv_cache_context::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il) const {
     return kv->cpy_v(ctx, v_cur, v_idxs, il, sinfos[i_cur]);
+}
+
+ggml_tensor * llama_kv_cache_context::get_tq_rotation() const {
+    return kv->get_tq_rotation();
 }
 
 ggml_tensor * llama_kv_cache_context::build_input_k_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const {

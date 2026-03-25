@@ -2058,6 +2058,16 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
+    // TQ4_0: rotate Q to match rotated K in cache
+    // score = Q^T · dequant(R·k) ≈ (R·Q)^T · (R·k) — rotate Q by R
+    if (ggml_tensor * tq_rot = mctx_cur->get_tq_rotation()) {
+        const int64_t d = tq_rot->ne[0];
+        const int64_t n = ggml_nelements(q) / d;
+        q = ggml_reshape_2d(ctx0, q, d, n);
+        q = ggml_mul_mat(ctx0, ggml_transpose(ctx0, tq_rot), q);
+        q = ggml_reshape_3d(ctx0, q, q_cur->ne[0], q_cur->ne[1], q_cur->ne[2]);
+    }
+
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
     cb(cur, "kqv_out", il);
 
@@ -2141,6 +2151,15 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
 
+    // TQ4_0: rotate Q to match rotated K in cache
+    if (ggml_tensor * tq_rot = mctx_cur->get_tq_rotation()) {
+        const int64_t d = tq_rot->ne[0];
+        const int64_t n = ggml_nelements(q) / d;
+        q = ggml_reshape_2d(ctx0, q, d, n);
+        q = ggml_mul_mat(ctx0, ggml_transpose(ctx0, tq_rot), q);
+        q = ggml_reshape_3d(ctx0, q, q_cur->ne[0], q_cur->ne[1], q_cur->ne[2]);
+    }
+
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
     cb(cur, "kqv_out", il);
 
@@ -2207,6 +2226,15 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * q = q_cur;
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+
+    // TQ4_0: rotate Q to match rotated K in cache
+    if (ggml_tensor * tq_rot = mctx_cur->get_tq_rotation()) {
+        const int64_t d = tq_rot->ne[0];
+        const int64_t n = ggml_nelements(q) / d;
+        q = ggml_reshape_2d(ctx0, q, d, n);
+        q = ggml_mul_mat(ctx0, ggml_transpose(ctx0, tq_rot), q);
+        q = ggml_reshape_3d(ctx0, q, q_cur->ne[0], q_cur->ne[1], q_cur->ne[2]);
+    }
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
     cb(cur, "kqv_out", il);

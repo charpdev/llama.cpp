@@ -26,6 +26,13 @@ void tq_init(int head_dim, uint64_t seed);
 
 void tq_cleanup(void);
 
+/* Returns pointer to the rotation matrix (head_dim x head_dim, row-major).
+ * Returns NULL if tq_init() has not been called. */
+float * tq_get_rotation(void);
+
+/* Returns the head_dim used in tq_init(). */
+int tq_get_head_dim(void);
+
 /* Quantize k float values into TQ4_0 blocks.
  * Applies rotation then Q4_0 quantization.
  * k must be a multiple of head_dim. */
