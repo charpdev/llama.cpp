@@ -86,6 +86,7 @@ static mmq_q8_1_ds_layout mmq_get_q8_1_ds_layout(const ggml_type type_x) {
             return MMQ_Q8_1_DS_LAYOUT_DS4;
         case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_IQ4_NL:
+        case GGML_TYPE_TQ3_0:
             return MMQ_Q8_1_DS_LAYOUT_D4;
         default:
             GGML_ABORT("fatal error");
@@ -202,6 +203,7 @@ static constexpr __host__ __device__ tile_x_sizes mmq_get_dp4a_tile_x_sizes(ggml
         case GGML_TYPE_IQ1_S:   return MMQ_DP4A_TXS_Q8_0;
         case GGML_TYPE_IQ4_XS:  return MMQ_DP4A_TXS_Q8_0;
         case GGML_TYPE_IQ4_NL:  return MMQ_DP4A_TXS_Q8_0;
+        case GGML_TYPE_TQ3_0:   return MMQ_DP4A_TXS_Q8_0;
         default:                return tile_x_sizes{0, 0, 0};
     }
 }
@@ -243,6 +245,7 @@ static constexpr __host__ __device__ int mmq_get_mma_tile_x_k(ggml_type type) {
         case GGML_TYPE_IQ1_S:   return MMQ_MMA_TILE_X_K_Q8_0;
         case GGML_TYPE_IQ4_XS:  return MMQ_MMA_TILE_X_K_Q8_0;
         case GGML_TYPE_IQ4_NL:  return MMQ_MMA_TILE_X_K_Q8_0;
+        case GGML_TYPE_TQ3_0:   return MMQ_MMA_TILE_X_K_Q8_0;
         default:                return 0;
     }
 }
@@ -3205,6 +3208,103 @@ static __device__ __forceinline__ void mmq_write_back_mma(
 
 // -------------------------------------------------------------------------------------------------------------------------------------
 
+
+
+// TQ3_0: optimized dequant to q8_0 format — minimal shuffles
+static __device__ __forceinline__ float tq3_0_sign_mmq(int i) {
+    return ((((unsigned)i * 0x9E3779B9u) >> 31) & 1) ? -1.0f : 1.0f;
+}
+
+template <int mmq_y, bool need_check> static __device__ __forceinline__ void load_tiles_tq3_0(
+    const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
+    constexpr int nwarps = mmq_get_nwarps_device();
+
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+    int   * x_qs = (int   *)  x_tile;
+    float * x_df = (float *) (x_tile + 2*MMQ_TILE_NE_K);
+#else
+    constexpr tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(GGML_TYPE_Q8_0, mmq_y);
+    int   * x_qs = (int   *)  x_tile;
+    float * x_df = (float *) (x_qs + txs.qs);
+#endif
+
+    const int lane = threadIdx.x;
+
+    // Pre-scaled centroids: centroid / 3.5 * 127 ≈ int8 range for N(0,1) WHT output
+    // After WHT, values are ~N(0,1). Max abs ≈ 3.5 (99.95th percentile of |N(0,1)| × sqrt(1))
+    // Fixed scale = rms * 3.5 / 127. Pre-divide centroids by 3.5 and multiply by 127.
+    static const float c8[8] = {
+        -2.1519f * (127.0f/3.5f), -1.3439f * (127.0f/3.5f),
+        -0.7560f * (127.0f/3.5f), -0.2451f * (127.0f/3.5f),
+         0.2451f * (127.0f/3.5f),  0.7560f * (127.0f/3.5f),
+         1.3439f * (127.0f/3.5f),  2.1519f * (127.0f/3.5f)
+    };
+    const float inv_sqrt32 = 1.0f / sqrtf(32.0f);
+    const float sign = tq3_0_sign_mmq(lane);
+
+#pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += nwarps) {
+        int i = i0 + threadIdx.y;
+        if (need_check) { i = min(i, i_max); }
+
+        for (int blk = 0; blk < 2; blk++) {
+            const block_tq3_0 * bxi = (const block_tq3_0 *)x + kbx0 + i*stride + blk;
+            const float rms = __half2float(bxi->d);
+
+            // Unpack 3-bit index
+            const int g = lane / 8, r = lane % 8;
+            const uint8_t * qp = bxi->qs + g * 3;
+            uint8_t idx;
+            switch (r) {
+                case 0: idx =  qp[0]       & 7; break;
+                case 1: idx = (qp[0] >> 3) & 7; break;
+                case 2: idx = ((qp[0] >> 6) | (qp[1] << 2)) & 7; break;
+                case 3: idx = (qp[1] >> 1) & 7; break;
+                case 4: idx = (qp[1] >> 4) & 7; break;
+                case 5: idx = ((qp[1] >> 7) | (qp[2] << 1)) & 7; break;
+                case 6: idx = (qp[2] >> 2) & 7; break;
+                default: idx = (qp[2] >> 5) & 7; break;
+            }
+
+            // Pre-scaled centroid (already in ~int8 range after WHT)
+            float val = c8[idx];
+
+            // WHT butterfly — 5 stages, minimal shuffles
+            #pragma unroll
+            for (int step = 1; step < 32; step <<= 1) {
+                float other = __shfl_xor_sync(0xFFFFFFFF, val, step);
+                val = (lane & step) ? (other - val) : (other + val);
+            }
+
+            // Apply normalize + sign + rms, clamp to int8
+            val = val * inv_sqrt32 * sign * rms;
+            int8_t qval = max(-127, min(127, (int)rintf(val)));
+
+            // Fixed scale (no warp reduce needed!)
+            const float scale = rms * 3.5f / 127.0f;
+
+            // Write int8 directly to shared memory, read back as int32
+            // Use x_qs as byte array temporarily
+            {
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+                int8_t * x_bytes = (int8_t *)(x_qs + i*MMQ_MMA_TILE_X_K_Q8_0 + blk*MMQ_TILE_NE_K);
+#else
+                int8_t * x_bytes = (int8_t *)(x_qs + i*(2*MMQ_TILE_NE_K + 1) + blk*MMQ_TILE_NE_K);
+#endif
+                x_bytes[lane] = qval;
+            }
+
+            if (lane == 0) {
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+                x_df[i*MMQ_MMA_TILE_X_K_Q8_0 + blk] = scale;
+#else
+                x_df[i*(2*MMQ_TILE_NE_K/QI8_0) + i/(QI8_0/2) + blk] = scale;
+#endif
+            }
+        }
+    }
+}
+
 template <int mmq_x, int mmq_y, bool need_check, ggml_type type>
 struct mmq_type_traits;
 
@@ -3258,6 +3358,14 @@ struct mmq_type_traits<mmq_x, mmq_y, need_check, GGML_TYPE_MXFP4> {
     static constexpr load_tiles_mmq_t load_tiles   = load_tiles_mxfp4<mmq_y, need_check>;
     static constexpr vec_dot_mmq_t    vec_dot_mma  = vec_dot_q8_0_q8_1_mma<mmq_x, mmq_y, MMQ_Q8_1_DS_LAYOUT_D4>;
 #endif // BLACKWELL_MMA_AVAILABLE
+    static constexpr vec_dot_mmq_t    vec_dot_dp4a = vec_dot_q8_0_q8_1_dp4a<mmq_x, mmq_y>;
+};
+
+template <int mmq_x, int mmq_y, bool need_check>
+struct mmq_type_traits<mmq_x, mmq_y, need_check, GGML_TYPE_TQ3_0> {
+    static constexpr int              vdr          = VDR_Q8_0_Q8_1_MMQ;
+    static constexpr load_tiles_mmq_t load_tiles   = load_tiles_tq3_0<mmq_y, need_check>;
+    static constexpr vec_dot_mmq_t    vec_dot_mma  = vec_dot_q8_0_q8_1_mma<mmq_x, mmq_y, MMQ_Q8_1_DS_LAYOUT_D4>;
     static constexpr vec_dot_mmq_t    vec_dot_dp4a = vec_dot_q8_0_q8_1_dp4a<mmq_x, mmq_y>;
 };
 

@@ -1235,3 +1235,76 @@ static __device__ __forceinline__ float vec_dot_iq4_xs_q8_1(
     const float d = __half2float(bq4->d) * __low2float(bq8_1[iqs/4].ds);
     return d * sumi;
 }
+
+// TQ3_0: dequant full block via warp-shuffle WHT, then dot with q8_1
+#define VDR_TQ3_0_Q8_1_MMVQ 4
+
+static __device__ __forceinline__ float vec_dot_tq3_0_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_tq3_0 * bq = (const block_tq3_0 *) vbq + kbx;
+    const float d = __half2float(bq->d);
+
+    // Centroids and signs in registers
+    const float centroids[8] = {-2.1519f, -1.3439f, -0.7560f, -0.2451f, 0.2451f, 0.7560f, 1.3439f, 2.1519f};
+    const float signs[32] = {
+        +1.0f, -1.0f, +1.0f, -1.0f, +1.0f, +1.0f, -1.0f, +1.0f,
+        -1.0f, -1.0f, +1.0f, -1.0f, +1.0f, +1.0f, -1.0f, +1.0f,
+        -1.0f, -1.0f, +1.0f, -1.0f, +1.0f, -1.0f, -1.0f, +1.0f,
+        -1.0f, +1.0f, +1.0f, -1.0f, +1.0f, -1.0f, -1.0f, +1.0f,
+    };
+
+    // Unpack 3-bit indices for elements iqs*8 .. iqs*8+7
+    const int g = iqs; // group index (0..3), each group = 8 elements
+    const uint8_t * qp = bq->qs + g * 3;
+    float vals[8];
+    vals[0] = centroids[ qp[0]       & 7];
+    vals[1] = centroids[(qp[0] >> 3) & 7];
+    vals[2] = centroids[((qp[0] >> 6) | (qp[1] << 2)) & 7];
+    vals[3] = centroids[(qp[1] >> 1) & 7];
+    vals[4] = centroids[(qp[1] >> 4) & 7];
+    vals[5] = centroids[((qp[1] >> 7) | (qp[2] << 1)) & 7];
+    vals[6] = centroids[(qp[2] >> 2) & 7];
+    vals[7] = centroids[(qp[2] >> 5) & 7];
+
+    // Inverse WHT on the full 32-element block via warp shuffle
+    // Each thread holds 8 values; we need to exchange between threads for the butterfly
+    // For steps 1,2,4: butterfly within each thread's 8 values
+    // For steps 8,16: butterfly between threads via shuffle
+
+    // Steps 1,2,4: local butterfly within 8 elements
+    for (int step = 1; step < 8; step <<= 1) {
+        for (int i = 0; i < 8; i += step << 1) {
+            for (int j = i; j < i + step; j++) {
+                float a = vals[j], b = vals[j + step];
+                vals[j] = a + b; vals[j + step] = a - b;
+            }
+        }
+    }
+
+    // Steps 8, 16: inter-thread butterfly via warp shuffle
+    // Thread g holds elements g*8..g*8+7
+    // Step 8: exchange between thread pairs (0,1) and (2,3)
+    for (int step_t = 1; step_t < 4; step_t <<= 1) {
+        int partner = iqs ^ step_t;
+        for (int j = 0; j < 8; j++) {
+            float other = __shfl_sync(0xF, vals[j], partner); // only 4 threads active
+            if (iqs & step_t) {
+                vals[j] = other - vals[j];
+            } else {
+                vals[j] = other + vals[j];
+            }
+        }
+    }
+
+    // Normalize + undo signs + scale
+    const float norm = d / sqrtf(32.0f);
+    float sum = 0.0f;
+    const float2 ds8 = __half22float2(bq8_1->ds);
+    for (int j = 0; j < 8; j++) {
+        float dequant = vals[j] * norm * signs[g * 8 + j];
+        sum += dequant * (float)bq8_1->qs[g * 8 + j];
+    }
+
+    return sum * ds8.x;
+}
