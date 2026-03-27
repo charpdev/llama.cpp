@@ -1300,7 +1300,26 @@ static void ggml_cuda_op_mul_mat_cublas(
     const bool use_fp16 = (src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type)) && ggml_is_contiguous(src0) && row_diff == src0->ne[1] && dst->op_params[0] == GGML_PREC_DEFAULT
         && src0->type != GGML_TYPE_TQ3_0;
 
-    if (supports_bf16 && src0->type == GGML_TYPE_BF16 && ggml_is_contiguous(src0) && row_diff == src0->ne[1]) {
+    if (src0->type == GGML_TYPE_TQ3_0) {
+        // TQ3_0: fp16 inputs, fp32 compute (WHT values need fp32 accumulation)
+        ggml_cuda_pool_alloc<half> src0_f16(ctx.pool(id), row_diff*ne00);
+        const to_fp16_cuda_t dq = ggml_get_to_fp16_cuda(src0->type);
+        GGML_ASSERT(dq != nullptr);
+        dq(src0_dd_i, src0_f16.get(), row_diff*ne00, stream);
+
+        ggml_cuda_pool_alloc<half> src1_f16(ctx.pool(id), src1_ncols*ne10);
+        const to_fp16_cuda_t cvt = ggml_get_to_fp16_cuda(GGML_TYPE_F32);
+        cvt(src1_ddf_i, src1_f16.get(), src1_ncols*ne10, stream);
+
+        const float alpha = 1.0f, beta = 0.0f;
+        CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(id), stream));
+        CUBLAS_CHECK(cublasGemmEx(ctx.cublas_handle(id), CUBLAS_OP_T, CUBLAS_OP_N,
+                row_diff, src1_ncols, ne10,
+                &alpha, src0_f16.get(), CUDA_R_16F, ne00,
+                        src1_f16.get(), CUDA_R_16F, ne10,
+                &beta,  dst_dd_i,       CUDA_R_32F, ldc,
+                CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+    } else if (supports_bf16 && src0->type == GGML_TYPE_BF16 && ggml_is_contiguous(src0) && row_diff == src0->ne[1]) {
         ggml_cuda_pool_alloc<nv_bfloat16> src1_as_bf16(ctx.pool(id));
         if (src1->type != GGML_TYPE_BF16) {
             const to_bf16_cuda_t to_bf16_cuda = ggml_get_to_bf16_cuda(src1->type);
