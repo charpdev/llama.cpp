@@ -3230,7 +3230,7 @@ template <int mmq_y, bool need_check> static __device__ __forceinline__ void loa
     float * x_df = (float *) (x_qs + txs.qs);
 #endif
 
-    constexpr int blocks_per_tile_x_row = 2*MMQ_TILE_NE_K / QK_TQ3_0; // 4 TQ3 blocks -> q8_0 layout
+    constexpr int blocks_per_tile_x_row = 2*MMQ_TILE_NE_K / QI8_0; // 8 q8-packed slots per row
     constexpr int rows_per_warp_group = nwarps / blocks_per_tile_x_row;
     static_assert(rows_per_warp_group > 0, "Not enough warps for TQ3_0 MMQ tile loader");
 
@@ -3289,11 +3289,15 @@ template <int mmq_y, bool need_check> static __device__ __forceinline__ void loa
         const float d  = __shfl_sync(0xFFFFFFFF, a / 127.0f, 0);
         const float id = __shfl_sync(0xFFFFFFFF, a > 0.0f ? 127.0f / a : 0.0f, 0);
 
-        // 5. Quantize two neighboring values into the exact q8_0 tile slot layout.
+        // 5. Quantize four neighboring values into the exact q8_0 tile slot layout.
         const int q = max(-127, min(127, (int) roundf(xf * id)));
+        const int slot = lane % QI8_0;
+        const int q1 = __shfl_sync(0xFFFFFFFF, q, 4*slot + 0);
+        const int q2 = __shfl_sync(0xFFFFFFFF, q, 4*slot + 1);
+        const int q3 = __shfl_sync(0xFFFFFFFF, q, 4*slot + 2);
+        const int q4 = __shfl_sync(0xFFFFFFFF, q, 4*slot + 3);
         if (lane < QI8_0) {
-            const int q_hi = __shfl_sync(0xFFFFFFFF, q, lane + QI8_0);
-            const uint32_t packed_q = (uint8_t) q | ((uint8_t) q_hi << 8);
+            const uint32_t packed_q = (uint8_t) q1 | ((uint8_t) q2 << 8) | ((uint8_t) q3 << 16) | ((uint8_t) q4 << 24);
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
             x_qs[i*MMQ_MMA_TILE_X_K_Q8_0 + blk*QI8_0 + lane] = packed_q;
             if (lane == 0) {
