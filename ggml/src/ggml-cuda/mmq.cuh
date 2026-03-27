@@ -3217,13 +3217,25 @@ static __device__ __forceinline__ float tq3_0_sign_mmq(int i) {
 
 template <int mmq_y, bool need_check> static __device__ __forceinline__ void load_tiles_tq3_0(
     const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
-
-    int   * x_qs = (int   *)  x_tile;
-    float * x_df = (float *) (x_qs + WARP_SIZE);
-
     constexpr int nwarps = mmq_get_nwarps_device();
-    const int lane = threadIdx.x % WARP_SIZE;
-    const int i0   = threadIdx.x / WARP_SIZE;
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    static_assert(WARP_SIZE == QK_TQ3_0, "TQ3_0 MMQ assumes one 32-lane warp per block");
+
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+    int   * x_qs = (int   *)  x_tile;
+    float * x_df = (float *) (x_qs + 2*MMQ_TILE_NE_K);
+#else
+    constexpr tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(GGML_TYPE_Q8_0, mmq_y);
+    int   * x_qs = (int   *)  x_tile;
+    float * x_df = (float *) (x_qs + txs.qs);
+#endif
+
+    constexpr int blocks_per_tile_x_row = 2*MMQ_TILE_NE_K / QK_TQ3_0; // 4 TQ3 blocks -> q8_0 layout
+    constexpr int rows_per_warp_group = nwarps / blocks_per_tile_x_row;
+    static_assert(rows_per_warp_group > 0, "Not enough warps for TQ3_0 MMQ tile loader");
+
+    const int lane = threadIdx.x;
+    const int warp = threadIdx.y;
 
     constexpr float tq3_centroids[8] = {
         -2.1519f, -1.3439f, -0.7560f, -0.2451f, 0.2451f, 0.7560f, 1.3439f, 2.1519f
@@ -3233,71 +3245,66 @@ template <int mmq_y, bool need_check> static __device__ __forceinline__ void loa
         return ((((unsigned)i * 0x9E3779B9u) >> 31) & 1) ? -1.0f : 1.0f;
     };
 
-    for (int i = i0; i < mmq_y; i += nwarps) {
+    for (int i0 = 0; i0 < mmq_y; i0 += rows_per_warp_group) {
+        const int i = i0 + warp / blocks_per_tile_x_row;
         if (need_check && i >= i_max) break;
 
-        for (int blk = 0; blk < 2; ++blk) {
-            const block_tq3_0 * bxi = (const block_tq3_0 *)x + kbx0 + i*stride + blk;
-            const float rms = __half2float(bxi->d);
+        const int blk = warp % blocks_per_tile_x_row;
+        const block_tq3_0 * bxi = (const block_tq3_0 *)x + kbx0 + i*stride + blk;
+        const float rms = __half2float(bxi->d);
 
-            // 1. Unpack centroid for this lane
-            const int g = lane / 8, r = lane % 8;
-            const uint8_t * qp = bxi->qs + g * 3;
-            uint8_t idx;
-            switch(r) {
-                case 0: idx =  qp[0]       & 7; break;
-                case 1: idx = (qp[0] >> 3) & 7; break;
-                case 2: idx = ((qp[0] >> 6) | (qp[1] << 2)) & 7; break;
-                case 3: idx = (qp[1] >> 1) & 7; break;
-                case 4: idx = (qp[1] >> 4) & 7; break;
-                case 5: idx = ((qp[1] >> 7) | (qp[2] << 1)) & 7; break;
-                case 6: idx = (qp[2] >> 2) & 7; break;
-                default: idx = (qp[2] >> 5) & 7; break;
-            }
+        // 1. Unpack centroid for this lane.
+        const int g = lane / 8, r = lane % 8;
+        const uint8_t * qp = bxi->qs + g * 3;
+        uint8_t idx;
+        switch (r) {
+            case 0: idx =  qp[0]       & 7; break;
+            case 1: idx = (qp[0] >> 3) & 7; break;
+            case 2: idx = ((qp[0] >> 6) | (qp[1] << 2)) & 7; break;
+            case 3: idx = (qp[1] >> 1) & 7; break;
+            case 4: idx = (qp[1] >> 4) & 7; break;
+            case 5: idx = ((qp[1] >> 7) | (qp[2] << 1)) & 7; break;
+            case 6: idx = (qp[2] >> 2) & 7; break;
+            default: idx = (qp[2] >> 5) & 7; break;
+        }
 
-            // 2. WHT inverse via warp shuffle
-            float val = tq3_centroids[idx];
-            #pragma unroll
-            for (int step = 1; step < 32; step <<= 1) {
-                float other = __shfl_xor_sync(0xFFFFFFFF, val, step);
-                val = (lane & step) ? (other - val) : (other + val);
-            }
+        // 2. Inverse WHT for the full 32-element block.
+        float val = tq3_centroids[idx];
+        #pragma unroll
+        for (int step = 1; step < warp_size; step <<= 1) {
+            const float other = __shfl_xor_sync(0xFFFFFFFF, val, step);
+            val = (lane & step) ? (other - val) : (other + val);
+        }
 
-            // 3. Exact dequantized float
-            float xf = val / sqrtf(32.0f) * tq3_sign(lane) * rms;
+        // 3. Exact dequantized float for this lane.
+        const float xf = val / sqrtf(32.0f) * tq3_sign(lane) * rms;
 
-            // 4. Warp reduce amax
-            float a = fabsf(xf);
-            #pragma unroll
-            for (int m = 16; m > 0; m >>= 1) {
-                a = fmaxf(a, __shfl_xor_sync(0xFFFFFFFF, a, m));
-            }
+        // 4. Exact q8_0 block scale.
+        float a = fabsf(xf);
+        #pragma unroll
+        for (int m = warp_size >> 1; m > 0; m >>= 1) {
+            a = fmaxf(a, __shfl_xor_sync(0xFFFFFFFF, a, m));
+        }
 
-            // 5. Exact q8_0 scale
-            float d  = __shfl_sync(0xFFFFFFFF, a / 127.0f, 0);
-            float id = __shfl_sync(0xFFFFFFFF, a > 0.0f ? 127.0f / a : 0.0f, 0);
+        const float d  = __shfl_sync(0xFFFFFFFF, a / 127.0f, 0);
+        const float id = __shfl_sync(0xFFFFFFFF, a > 0.0f ? 127.0f / a : 0.0f, 0);
 
-            // 6. Quantize
-            int q = (int)roundf(xf * id);
-            q = max(-127, min(127, q));
-            int8_t qval = (int8_t)q;
-
-            // 7. Write bytes and scale in exact q8_0 layout
-            {
+        // 5. Quantize two neighboring values into the exact q8_0 tile slot layout.
+        const int q = max(-127, min(127, (int) roundf(xf * id)));
+        if (lane < QI8_0) {
+            const int q_hi = __shfl_sync(0xFFFFFFFF, q, lane + QI8_0);
+            const uint32_t packed_q = (uint8_t) q | ((uint8_t) q_hi << 8);
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
-                int8_t * x_bytes = (int8_t *)(x_qs + i*MMQ_MMA_TILE_X_K_Q8_0 + blk*MMQ_TILE_NE_K);
-                x_bytes[lane] = qval;
-                if (lane == 0) {
-                    x_df[i*MMQ_MMA_TILE_X_K_Q8_0 + blk] = d;
-                }
-#else
-                int8_t * x_bytes = (int8_t *)(x_qs + i*(2*MMQ_TILE_NE_K + 1) + blk*MMQ_TILE_NE_K);
-                x_bytes[lane] = qval;
-                if (lane == 0) {
-                    x_df[i*(2*MMQ_TILE_NE_K/QI8_0) + i/(QI8_0/2) + blk] = d;
-                }
-#endif
+            x_qs[i*MMQ_MMA_TILE_X_K_Q8_0 + blk*QI8_0 + lane] = packed_q;
+            if (lane == 0) {
+                x_df[i*MMQ_MMA_TILE_X_K_Q8_0 + blk] = d;
             }
+#else
+            x_qs[i*(2*MMQ_TILE_NE_K + 1) + blk*QI8_0 + lane] = packed_q;
+            if (lane == 0) {
+                x_df[i*(2*MMQ_TILE_NE_K/QI8_0) + i/(QI8_0/2) + blk] = d;
+            }
+#endif
         }
     }
 }
