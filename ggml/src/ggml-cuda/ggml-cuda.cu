@@ -61,6 +61,8 @@
 #include "ggml-cuda/tri.cuh"
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/fill.cuh"
+#include "ggml-quants.h"
+#include "ggml-cuda/tq3-native.cuh"
 #include "ggml.h"
 
 #include <algorithm>
@@ -80,6 +82,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
+#include <cmath>
 #include <string>
 #include <vector>
 #include <unordered_set>
@@ -115,6 +118,78 @@ int ggml_cuda_get_device() {
     int id;
     CUDA_CHECK(cudaGetDevice(&id));
     return id;
+}
+
+static bool ggml_cuda_tq3_native_prefill_debug_enabled() {
+    static bool enabled = getenv("GGML_CUDA_TQ3_NATIVE_PREFILL") != nullptr;
+    return enabled;
+}
+
+static void ggml_cuda_native_prefill_debug(ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src0, const ggml_tensor * src1) {
+
+    if (!ggml_cuda_tq3_native_prefill_debug_enabled()) {
+        return;
+    }
+    if (src0->type != GGML_TYPE_TQ3_0 || src1->type != GGML_TYPE_F32) {
+        return;
+    }
+
+    block_tq3_0 host_blk;
+    block_q8_0 host_q8;
+    float host_act[QK_TQ3_0];
+    float host_deq[QK_TQ3_0];
+    const block_tq3_0 * device_blk = (const block_tq3_0 *) src0->data;
+    const float * device_act = (const float *) src1->data;
+
+    CUDA_CHECK(cudaMemcpyAsync(&host_blk, device_blk, sizeof(host_blk), cudaMemcpyDeviceToHost, ctx.stream()));
+    CUDA_CHECK(cudaMemcpyAsync(host_act, device_act, sizeof(host_act), cudaMemcpyDeviceToHost, ctx.stream()));
+    CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+
+    quantize_row_q8_0_ref(host_act, &host_q8, QK_TQ3_0);
+    dequantize_row_tq3_0(&host_blk, host_deq, QK_TQ3_0);
+
+    float host_ref = 0.0f;
+    for (int i = 0; i < QK_TQ3_0; ++i) {
+        host_ref += host_deq[i] * host_act[i];
+    }
+
+    block_q8_0 * d_q8 = nullptr;
+    float * d_out = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_q8, sizeof(block_q8_0)));
+    CUDA_CHECK(cudaMalloc(&d_out, sizeof(float)));
+    CUDA_CHECK(cudaMemcpyAsync(d_q8, &host_q8, sizeof(host_q8), cudaMemcpyHostToDevice, ctx.stream()));
+
+    constexpr int warmup = 4;
+    constexpr int niters = 16;
+    for (int i = 0; i < warmup; ++i) {
+        ggml_cuda_native_tq3_dot_kernel<<<1, 32, 0, ctx.stream()>>>(device_blk, d_q8, d_out, 1);
+    }
+
+    cudaEvent_t start, stop;
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+    CUDA_CHECK(cudaEventRecord(start, ctx.stream()));
+    for (int i = 0; i < niters; ++i) {
+        ggml_cuda_native_tq3_dot_kernel<<<1, 32, 0, ctx.stream()>>>(device_blk, d_q8, d_out, 1);
+    }
+    CUDA_CHECK(cudaEventRecord(stop, ctx.stream()));
+    CUDA_CHECK(cudaEventSynchronize(stop));
+
+    float native_ms = 0.0f;
+    CUDA_CHECK(cudaEventElapsedTime(&native_ms, start, stop));
+
+    float native_sum = 0.0f;
+    CUDA_CHECK(cudaMemcpyAsync(&native_sum, d_out, sizeof(float), cudaMemcpyDeviceToHost, ctx.stream()));
+    CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+
+    GGML_LOG_INFO("TQ3 native prefill debug sample: native=%f ref=%f diff=%e avg %.3f us/launch",
+        native_sum, host_ref, fabsf(native_sum - host_ref), 1000.0f * native_ms / niters);
+
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
+    CUDA_CHECK(cudaFree(d_q8));
+    CUDA_CHECK(cudaFree(d_out));
 }
 
 static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device) {
@@ -2300,6 +2375,10 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         use_mul_mat_f           = use_mul_mat_f             && ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, src1->ne[1], /*mul_mat_id=*/false);
         use_mul_mat_vec_f       = use_mul_mat_vec_f         && ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, src1->ne[1]);
         any_gpus_with_slow_fp16 = any_gpus_with_slow_fp16   || !fast_fp16_hardware_available(cc);
+    }
+
+    if (use_mul_mat_q && src0->type == GGML_TYPE_TQ3_0 && src1->type == GGML_TYPE_F32) {
+        ggml_cuda_native_prefill_debug(ctx, src0, src1);
     }
 
     // debug helpers

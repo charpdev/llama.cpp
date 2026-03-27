@@ -3,6 +3,10 @@
 #include <cuda_fp16.h>
 #include <stdint.h>
 
+#define GGML_COMMON_DECL_CUDA
+#include "../ggml-common.h"
+#undef GGML_COMMON_DECL_CUDA
+
 #ifndef QK_TQ3_0
 #define QK_TQ3_0 32
 #endif
@@ -68,3 +72,9 @@ static __device__ __forceinline__ float vec_dot_tq3_0_q8_0_native_block(
 
     return contrib;
 }
+
+__global__ void ggml_cuda_native_tq3_dot_kernel(
+        const block_tq3_0 * __restrict__ in,
+        const block_q8_0  * __restrict__ act,
+        float * __restrict__ out,
+        int nblocks);
