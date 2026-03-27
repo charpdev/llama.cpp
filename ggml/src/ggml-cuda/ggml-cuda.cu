@@ -1379,7 +1379,7 @@ static void ggml_cuda_op_mul_mat_cublas(
     if (src0->type == GGML_TYPE_TQ3_0) {
         // TQ3_0: use native prefill kernel for PP (amortizes WHT across tokens)
         // Fall back to fp16+fp32compute cuBLAS for TG (src1_ncols < 8)
-        if (src1_ncols >= TQ3_PREFILL_TILE_N) {
+        if (src1_ncols >= TQ3_PREFILL_MIN_TOKENS) {
             tq3_prefill_launch(
                 (const block_tq3_0 *) src0_dd_i,
                 src1_ddf_i,
