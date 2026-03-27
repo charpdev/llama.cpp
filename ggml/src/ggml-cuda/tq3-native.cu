@@ -1,4 +1,5 @@
 #include "tq3-native.cuh"
+#include "common.cuh"
 
 __global__ void ggml_cuda_native_tq3_dot_kernel(
         const block_tq3_0 * __restrict__ in,
@@ -29,3 +30,4 @@ static __global__ void tq3_rotate_act_kernel(float * __restrict__ x, int64_t n) 
 void ggml_cuda_tq3_rotate_act(float * x, int64_t n, cudaStream_t stream) {
     tq3_rotate_act_kernel<<<n / QK_TQ3_0, QK_TQ3_0, 0, stream>>>(x, n);
 }
+

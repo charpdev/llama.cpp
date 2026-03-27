@@ -1059,13 +1059,14 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
 
     "CROSS_ENTROPY_LOSS",
     "CROSS_ENTROPY_LOSS_BACK",
+    "TURBO_WHT",
     "OPT_STEP_ADAMW",
     "OPT_STEP_SGD",
 
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 96, "GGML_OP_COUNT != 96");
+static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 96");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1175,7 +1176,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 96, "GGML_OP_COUNT != 96");
+static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 96");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6061,6 +6062,16 @@ struct ggml_tensor * ggml_cross_entropy_loss_back(
     result->src[1] = b;
     result->src[2] = c;
 
+    return result;
+}
+
+
+// turbo_wht
+
+struct ggml_tensor * ggml_turbo_wht(struct ggml_context * ctx, struct ggml_tensor * a) {
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, a);
+    result->op     = GGML_OP_TURBO_WHT;
+    result->src[0] = a;
     return result;
 }
 

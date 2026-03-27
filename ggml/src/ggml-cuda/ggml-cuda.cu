@@ -63,6 +63,7 @@
 #include "ggml-cuda/fill.cuh"
 #include "ggml-quants.h"
 #include "ggml-cuda/tq3-native.cuh"
+static void ggml_cuda_op_turbo_wht(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 #include "ggml-cuda/tq3-prefill.cuh"
 #include "ggml.h"
 
@@ -1377,13 +1378,18 @@ static void ggml_cuda_op_mul_mat_cublas(
         && src0->type != GGML_TYPE_TQ3_0;
 
     if (src0->type == GGML_TYPE_TQ3_0) {
-        // TQ3_0: use native prefill kernel for PP on contiguous weights only
-        // KV cache (non-contiguous) uses cublas — tiled kernel assumes row-major activations
+        // TQ3_0: rotate activations (out-of-place), then use simplified kernels
+        // Rotation: x_rot = WHT(sign*x)/sqrt(32) — eliminates WHT from load_tiles/vec_dot
+        const int64_t n_act = src1_ncols * ne10;
+        ggml_cuda_pool_alloc<float> src1_rot(ctx.pool(id), n_act);
+        CUDA_CHECK(cudaMemcpyAsync(src1_rot.get(), src1_ddf_i, n_act*sizeof(float), cudaMemcpyDeviceToDevice, stream));
+        ggml_cuda_tq3_rotate_act(src1_rot.get(), n_act, stream);
+
         const bool src1_is_contiguous = ggml_is_contiguous(src1);
         if (src1_ncols >= TQ3_PREFILL_MIN_TOKENS && src1_is_contiguous) {
             tq3_prefill_launch(
                 (const block_tq3_0 *) src0_dd_i,
-                src1_ddf_i,
+                src1_rot.get(),
                 dst_dd_i,
                 ne00, row_diff, src1_ncols,
                 stream);
@@ -1396,7 +1402,7 @@ static void ggml_cuda_op_mul_mat_cublas(
 
             ggml_cuda_pool_alloc<half> src1_f16(ctx.pool(id), src1_ncols*ne10);
             const to_fp16_cuda_t cvt = ggml_get_to_fp16_cuda(GGML_TYPE_F32);
-            cvt(src1_ddf_i, src1_f16.get(), src1_ncols*ne10, stream);
+            cvt(src1_rot.get(), src1_f16.get(), src1_ncols*ne10, stream);
 
             const float alpha = 1.0f, beta = 0.0f;
             CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(id), stream));
@@ -2907,6 +2913,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_RWKV_WKV7:
             ggml_cuda_op_rwkv_wkv7(ctx, dst);
+            break;
+        case GGML_OP_TURBO_WHT:
+            ggml_cuda_op_turbo_wht(ctx, dst);
             break;
         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
             ggml_cuda_cross_entropy_loss_back(ctx, dst);
@@ -5151,6 +5160,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
 #endif // GGML_USE_MUSA
         case GGML_OP_FLASH_ATTN_EXT:
             return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
+        case GGML_OP_TURBO_WHT:
+            return op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_CROSS_ENTROPY_LOSS:
         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
         case GGML_OP_OPT_STEP_ADAMW:
