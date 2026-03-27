@@ -15,6 +15,8 @@ typedef struct { __half d; uint8_t qs[12]; } block_tq3_0;
 typedef struct { __half d; int8_t qs[32]; } block_q8_0;
 typedef struct { __half d; __half s; int8_t qs[32]; } block_q8_1;
 
+#include "../ggml/src/ggml-cuda/tq3-native.cuh"
+
 // ===== Reference CPU implementation (ground truth) =====
 
 static float cpu_sign(int i) {
@@ -201,44 +203,8 @@ __global__ void k_vec_dot_tq3_q8_1(const block_tq3_0 *bq, const block_q8_1 *bq8_
     }
 }
 
-// Native weight-kernel scaffold: direct TQ3_0 x q8_0 block dot without
-// materializing a temporary dequant buffer. This is the first contract we need
-// for a real native prefill kernel.
-__device__ float gpu_vec_dot_tq3_0_q8_0_native(const block_tq3_0 *bq, const block_q8_0 *bq8_0) {
-    const int j = threadIdx.x;
-    const int g = j / 8;
-    const int r = j % 8;
-    const uint8_t * qp = bq->qs + g * 3;
-    uint8_t idx;
-    switch (r) {
-        case 0: idx =  qp[0]       & 7; break;
-        case 1: idx = (qp[0] >> 3) & 7; break;
-        case 2: idx = ((qp[0] >> 6) | (qp[1] << 2)) & 7; break;
-        case 3: idx = (qp[1] >> 1) & 7; break;
-        case 4: idx = (qp[1] >> 4) & 7; break;
-        case 5: idx = ((qp[1] >> 7) | (qp[2] << 1)) & 7; break;
-        case 6: idx = (qp[2] >> 2) & 7; break;
-        default: idx = (qp[2] >> 5) & 7; break;
-    }
-
-    float val = CENTROIDS[idx];
-    for (int step = 1; step < 32; step <<= 1) {
-        const float other = __shfl_xor_sync(0xFFFFFFFF, val, step);
-        val = (j & step) ? (other - val) : (other + val);
-    }
-
-    const float scale = (__half2float(bq->d) * __half2float(bq8_0->d)) / sqrtf(32.0f);
-    float contrib = val * SIGNS[j] * (float)bq8_0->qs[j] * scale;
-
-    for (int step = 16; step > 0; step >>= 1) {
-        contrib += __shfl_xor_sync(0xFFFFFFFF, contrib, step);
-    }
-
-    return contrib;
-}
-
 __global__ void k_vec_dot_tq3_q8_0_native(const block_tq3_0 *bq, const block_q8_0 *bq8_0, float *out) {
-    const float sum = gpu_vec_dot_tq3_0_q8_0_native(bq, bq8_0);
+    const float sum = vec_dot_tq3_0_q8_0_native_block(bq, bq8_0);
     if (threadIdx.x == 0) {
         out[0] = sum;
     }

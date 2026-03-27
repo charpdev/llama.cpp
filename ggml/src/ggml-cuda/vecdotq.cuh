@@ -1,6 +1,7 @@
 #pragma once
 
 #include "common.cuh"
+#include "tq3-native.cuh"
 
 #include <cstdint>
 
@@ -729,6 +730,13 @@ static __device__ __forceinline__ float vec_dot_q8_0_q8_1(
     }
 
     return vec_dot_q8_0_q8_1_impl<float, VDR_Q8_0_Q8_1_MMVQ>(v, u, bq8_0->d, __low2half(bq8_1->ds));
+}
+
+static __device__ __forceinline__ float vec_dot_tq3_0_q8_0_native(
+    const void * __restrict__ vbq, const block_q8_0 * __restrict__ bq8_0, const int & kbx) {
+
+    const block_tq3_0 * bq = (const block_tq3_0 *) vbq + kbx;
+    return vec_dot_tq3_0_q8_0_native_block(bq, bq8_0);
 }
 
 static __device__ __forceinline__ float vec_dot_q2_K_q8_1(
