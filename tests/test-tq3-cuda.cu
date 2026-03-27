@@ -13,6 +13,7 @@
 
 typedef struct { __half d; uint8_t qs[12]; } block_tq3_0;
 typedef struct { __half d; int8_t qs[32]; } block_q8_0;
+typedef struct { __half d; __half s; int8_t qs[32]; } block_q8_1;
 
 // ===== Reference CPU implementation (ground truth) =====
 
@@ -73,6 +74,21 @@ static void cpu_dequantize(float rms, const uint8_t *qs, float *out) {
 
 static float cpu_dot(const float *q, const float *k_dequant, int n) {
     float s = 0; for (int i = 0; i < n; i++) s += q[i]*k_dequant[i]; return s;
+}
+
+static void cpu_quantize_q8_1(const float *x, block_q8_1 *y) {
+    float amax = 0.0f;
+    for (int i = 0; i < 32; ++i) amax = fmaxf(amax, fabsf(x[i]));
+    const float d = amax / 127.0f;
+    const float id = d ? 1.0f/d : 0.0f;
+
+    y->d = __float2half(d);
+    int sum = 0;
+    for (int i = 0; i < 32; ++i) {
+        y->qs[i] = (int8_t) roundf(x[i] * id);
+        sum += y->qs[i];
+    }
+    y->s = __float2half(sum * d);
 }
 
 static float cpu_cosine(const float *a, const float *b, int n) {
@@ -138,6 +154,51 @@ __global__ void k_dequant(const block_tq3_0 *blks, float *out, int nb) {
         val = (j&step) ? (other-val) : (other+val);
     }
     out[i*32+j] = val * (d/sqrtf(32.0f)) * SIGNS[j];
+}
+
+__device__ float gpu_vec_dot_tq3_0_q8_1(const block_tq3_0 *bq, const block_q8_1 *bq8_1, int iqs) {
+    const int g = iqs / 4;
+    const uint8_t *qp = bq->qs + g * 3;
+    float vals[8];
+    vals[0] = CENTROIDS[ qp[0]       & 7];
+    vals[1] = CENTROIDS[(qp[0] >> 3) & 7];
+    vals[2] = CENTROIDS[((qp[0]>>6)|(qp[1]<<2)) & 7];
+    vals[3] = CENTROIDS[(qp[1] >> 1) & 7];
+    vals[4] = CENTROIDS[(qp[1] >> 4) & 7];
+    vals[5] = CENTROIDS[((qp[1]>>7)|(qp[2]<<1)) & 7];
+    vals[6] = CENTROIDS[(qp[2] >> 2) & 7];
+    vals[7] = CENTROIDS[(qp[2] >> 5) & 7];
+
+    for (int step = 1; step < 8; step <<= 1) {
+        for (int i = 0; i < 8; i += step*2) {
+            for (int j = i; j < i+step; ++j) {
+                float a = vals[j], b = vals[j+step];
+                vals[j] = a+b; vals[j+step] = a-b;
+            }
+        }
+    }
+
+    for (int step_t = 1; step_t < 4; step_t <<= 1) {
+        const int partner_lane = (threadIdx.x & ~3) | (g ^ step_t);
+        for (int j = 0; j < 8; ++j) {
+            const float other = __shfl_sync(0xFFFFFFFF, vals[j], partner_lane);
+            vals[j] = (g & step_t) ? (other - vals[j]) : (other + vals[j]);
+        }
+    }
+
+    const float norm = __half2float(bq->d) / sqrtf(32.0f);
+    float sum = 0.0f;
+    for (int j = 0; j < 8; ++j) {
+        sum += vals[j] * norm * SIGNS[g*8 + j] * (float)bq8_1->qs[g*8 + j];
+    }
+    return sum * __half2float(bq8_1->d);
+}
+
+__global__ void k_vec_dot_tq3_q8_1(const block_tq3_0 *bq, const block_q8_1 *bq8_1, float *partials) {
+    const int tid = threadIdx.x;
+    if (tid < 4) {
+        partials[tid] = gpu_vec_dot_tq3_0_q8_1(bq, bq8_1, tid * 4);
+    }
 }
 
 // ===== Tests =====
@@ -281,6 +342,57 @@ void test_gpu_dequant_to_fp16() {
     cudaFree(d_blk); cudaFree(d_y16); cudaFree(d_yf);
 }
 
+void test_gpu_vec_dot_tq3_q8_1() {
+    printf("Test 6: GPU vec_dot_tq3_0_q8_1 contract\n");
+
+    float x[32], y[32];
+    for (int i = 0; i < 32; ++i) {
+        x[i] = sinf(i * 0.3f + 1.0f);
+        y[i] = cosf(i * 0.17f - 0.2f);
+    }
+
+    float rms; uint8_t qs[12];
+    cpu_quantize(x, &rms, qs);
+    float x_dq[32];
+    cpu_dequantize(rms, qs, x_dq);
+
+    block_tq3_0 h_tq3;
+    h_tq3.d = __float2half(rms);
+    memcpy(h_tq3.qs, qs, sizeof(qs));
+
+    block_q8_1 h_q8_1;
+    cpu_quantize_q8_1(y, &h_q8_1);
+
+    float ref = 0.0f;
+    for (int i = 0; i < 32; ++i) {
+        ref += x_dq[i] * (__half2float(h_q8_1.d) * h_q8_1.qs[i]);
+    }
+
+    block_tq3_0 *d_tq3;
+    block_q8_1 *d_q8_1;
+    float *d_partials;
+    cudaMalloc(&d_tq3, sizeof(block_tq3_0));
+    cudaMalloc(&d_q8_1, sizeof(block_q8_1));
+    cudaMalloc(&d_partials, 4*sizeof(float));
+    cudaMemcpy(d_tq3, &h_tq3, sizeof(block_tq3_0), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_q8_1, &h_q8_1, sizeof(block_q8_1), cudaMemcpyHostToDevice);
+
+    k_vec_dot_tq3_q8_1<<<1,32>>>(d_tq3, d_q8_1, d_partials);
+    cudaDeviceSynchronize();
+
+    float partials[4];
+    cudaMemcpy(partials, d_partials, 4*sizeof(float), cudaMemcpyDeviceToHost);
+    float got = partials[0] + partials[1] + partials[2] + partials[3];
+
+    const float rel_err = fabsf(got - ref) / (fabsf(ref) + 1e-6f);
+    if (rel_err >= 2e-4f) {
+        printf("    ref=%f got=%f rel_err=%e partials=[%f, %f, %f, %f]\n",
+               ref, got, rel_err, partials[0], partials[1], partials[2], partials[3]);
+    }
+    check("vec_dot relative error < 2e-4", rel_err < 2e-4f);
+    cudaFree(d_tq3); cudaFree(d_q8_1); cudaFree(d_partials);
+}
+
 int main() {
     printf("=== TQ3_0 CUDA Unit Tests ===\n\n");
     test_cpu_roundtrip();
@@ -288,6 +400,7 @@ int main() {
     test_gpu_dequant_matches_cpu();
     test_gpu_full_pipeline_dot();
     test_gpu_dequant_to_fp16();
+    test_gpu_vec_dot_tq3_q8_1();
     printf("\n=== Results: %d passed, %d failed ===\n", tests_pass, tests_fail);
     return tests_fail > 0 ? 1 : 0;
 }
