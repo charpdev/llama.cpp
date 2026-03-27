@@ -13,7 +13,7 @@ static inline bool ggml_cuda_can_use_mul_mat_vec_q(
         && src1_type == GGML_TYPE_F32
         && dst_type == GGML_TYPE_F32
         && src1_ncols <= MMVQ_MAX_BATCH_SIZE
-        && src0_type != GGML_TYPE_TQ3_0;
+;  // TQ3_0 MMVQ enabled for contiguous weights (guarded in ggml_cuda_mul_mat)
 }
 
 void ggml_cuda_mul_mat_vec_q(ggml_backend_cuda_context & ctx,

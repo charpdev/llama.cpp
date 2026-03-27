@@ -2314,7 +2314,8 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
                                    ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) &&
                                    src0->view_src;
 
-    bool use_mul_mat_vec_q = ggml_cuda_can_use_mul_mat_vec_q(src0->type, src1->type, dst->type, src1->ne[1], bad_padding_clear);
+    bool use_mul_mat_vec_q = ggml_cuda_can_use_mul_mat_vec_q(src0->type, src1->type, dst->type, src1->ne[1], bad_padding_clear)
+        && (src0->type != GGML_TYPE_TQ3_0 || ggml_is_contiguous(src0));  // TQ3_0 MMVQ only for contiguous weights
 
     // fusion is not universally faster on Pascal
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
@@ -2355,7 +2356,8 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
     bool use_mul_mat_f     = !ggml_is_quantized(src0->type)
         && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
-    bool use_mul_mat_vec_q = ggml_cuda_can_use_mul_mat_vec_q(src0->type, src1->type, dst->type, src1->ne[1], bad_padding_clear);
+    bool use_mul_mat_vec_q = ggml_cuda_can_use_mul_mat_vec_q(src0->type, src1->type, dst->type, src1->ne[1], bad_padding_clear)
+        && (src0->type != GGML_TYPE_TQ3_0 || ggml_is_contiguous(src0));  // TQ3_0 MMVQ only for contiguous weights
     // For TQ3_0: only use MMQ for contiguous src0 (weights), not KV cache views
     const bool tq3_mmq_ok = src0->type != GGML_TYPE_TQ3_0 || ggml_is_contiguous(src0);
     bool use_mul_mat_q     = ggml_is_quantized(src0->type) && !bad_padding_clear
