@@ -201,6 +201,49 @@ __global__ void k_vec_dot_tq3_q8_1(const block_tq3_0 *bq, const block_q8_1 *bq8_
     }
 }
 
+// Native weight-kernel scaffold: direct TQ3_0 x q8_0 block dot without
+// materializing a temporary dequant buffer. This is the first contract we need
+// for a real native prefill kernel.
+__device__ float gpu_vec_dot_tq3_0_q8_0_native(const block_tq3_0 *bq, const block_q8_0 *bq8_0) {
+    const int j = threadIdx.x;
+    const int g = j / 8;
+    const int r = j % 8;
+    const uint8_t * qp = bq->qs + g * 3;
+    uint8_t idx;
+    switch (r) {
+        case 0: idx =  qp[0]       & 7; break;
+        case 1: idx = (qp[0] >> 3) & 7; break;
+        case 2: idx = ((qp[0] >> 6) | (qp[1] << 2)) & 7; break;
+        case 3: idx = (qp[1] >> 1) & 7; break;
+        case 4: idx = (qp[1] >> 4) & 7; break;
+        case 5: idx = ((qp[1] >> 7) | (qp[2] << 1)) & 7; break;
+        case 6: idx = (qp[2] >> 2) & 7; break;
+        default: idx = (qp[2] >> 5) & 7; break;
+    }
+
+    float val = CENTROIDS[idx];
+    for (int step = 1; step < 32; step <<= 1) {
+        const float other = __shfl_xor_sync(0xFFFFFFFF, val, step);
+        val = (j & step) ? (other - val) : (other + val);
+    }
+
+    const float scale = (__half2float(bq->d) * __half2float(bq8_0->d)) / sqrtf(32.0f);
+    float contrib = val * SIGNS[j] * (float)bq8_0->qs[j] * scale;
+
+    for (int step = 16; step > 0; step >>= 1) {
+        contrib += __shfl_xor_sync(0xFFFFFFFF, contrib, step);
+    }
+
+    return contrib;
+}
+
+__global__ void k_vec_dot_tq3_q8_0_native(const block_tq3_0 *bq, const block_q8_0 *bq8_0, float *out) {
+    const float sum = gpu_vec_dot_tq3_0_q8_0_native(bq, bq8_0);
+    if (threadIdx.x == 0) {
+        out[0] = sum;
+    }
+}
+
 // ===== Tests =====
 
 int tests_pass = 0, tests_fail = 0;
@@ -393,6 +436,60 @@ void test_gpu_vec_dot_tq3_q8_1() {
     cudaFree(d_tq3); cudaFree(d_q8_1); cudaFree(d_partials);
 }
 
+void test_gpu_vec_dot_tq3_q8_0_native() {
+    printf("Test 7: GPU native vec_dot_tq3_0_q8_0 scaffold\n");
+
+    float x[32], y[32];
+    for (int i = 0; i < 32; ++i) {
+        x[i] = sinf(i * 0.19f + 0.4f);
+        y[i] = cosf(i * 0.11f - 0.3f);
+    }
+
+    float rms; uint8_t qs[12];
+    cpu_quantize(x, &rms, qs);
+    float x_dq[32];
+    cpu_dequantize(rms, qs, x_dq);
+
+    block_tq3_0 h_tq3;
+    h_tq3.d = __float2half(rms);
+    memcpy(h_tq3.qs, qs, sizeof(qs));
+
+    block_q8_0 h_q8_0;
+    float amax = 0.0f;
+    for (int i = 0; i < 32; ++i) amax = fmaxf(amax, fabsf(y[i]));
+    const float d = amax / 127.0f;
+    const float id = d ? 1.0f / d : 0.0f;
+    h_q8_0.d = __float2half(d);
+    for (int i = 0; i < 32; ++i) h_q8_0.qs[i] = (int8_t) roundf(y[i] * id);
+
+    float ref = 0.0f;
+    for (int i = 0; i < 32; ++i) {
+        ref += x_dq[i] * (__half2float(h_q8_0.d) * h_q8_0.qs[i]);
+    }
+
+    block_tq3_0 *d_tq3;
+    block_q8_0 *d_q8_0;
+    float *d_out;
+    cudaMalloc(&d_tq3, sizeof(block_tq3_0));
+    cudaMalloc(&d_q8_0, sizeof(block_q8_0));
+    cudaMalloc(&d_out, sizeof(float));
+    cudaMemcpy(d_tq3, &h_tq3, sizeof(block_tq3_0), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_q8_0, &h_q8_0, sizeof(block_q8_0), cudaMemcpyHostToDevice);
+
+    k_vec_dot_tq3_q8_0_native<<<1,32>>>(d_tq3, d_q8_0, d_out);
+    cudaDeviceSynchronize();
+
+    float got = 0.0f;
+    cudaMemcpy(&got, d_out, sizeof(float), cudaMemcpyDeviceToHost);
+    const float rel_err = fabsf(got - ref) / (fabsf(ref) + 1e-6f);
+    if (rel_err >= 2e-4f) {
+        printf("    ref=%f got=%f rel_err=%e\n", ref, got, rel_err);
+    }
+    check("native vec_dot relative error < 2e-4", rel_err < 2e-4f);
+
+    cudaFree(d_tq3); cudaFree(d_q8_0); cudaFree(d_out);
+}
+
 int main() {
     printf("=== TQ3_0 CUDA Unit Tests ===\n\n");
     test_cpu_roundtrip();
@@ -401,6 +498,7 @@ int main() {
     test_gpu_full_pipeline_dot();
     test_gpu_dequant_to_fp16();
     test_gpu_vec_dot_tq3_q8_1();
+    test_gpu_vec_dot_tq3_q8_0_native();
     printf("\n=== Results: %d passed, %d failed ===\n", tests_pass, tests_fail);
     return tests_fail > 0 ? 1 : 0;
 }
