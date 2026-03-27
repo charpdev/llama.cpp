@@ -1377,9 +1377,10 @@ static void ggml_cuda_op_mul_mat_cublas(
         && src0->type != GGML_TYPE_TQ3_0;
 
     if (src0->type == GGML_TYPE_TQ3_0) {
-        // TQ3_0: use native prefill kernel for PP (amortizes WHT across tokens)
-        // Fall back to fp16+fp32compute cuBLAS for TG (src1_ncols < 8)
-        if (src1_ncols >= TQ3_PREFILL_MIN_TOKENS) {
+        // TQ3_0: use native prefill kernel for PP on contiguous weights only
+        // KV cache (non-contiguous) uses cublas — tiled kernel assumes row-major activations
+        const bool src1_is_contiguous = ggml_is_contiguous(src1);
+        if (src1_ncols >= TQ3_PREFILL_MIN_TOKENS && src1_is_contiguous) {
             tq3_prefill_launch(
                 (const block_tq3_0 *) src0_dd_i,
                 src1_ddf_i,
