@@ -3,6 +3,19 @@
 #define MMVQ_MAX_BATCH_SIZE 8 // Max. batch size for which to use MMVQ kernels.
 #define MMVQ_MMID_MAX_BATCH_SIZE 4 // Max. batch size for which to use MMVQ kernels for MUL_MAT_ID
 
+static inline bool ggml_cuda_can_use_mul_mat_vec_q(
+        const ggml_type src0_type,
+        const ggml_type src1_type,
+        const ggml_type dst_type,
+        const int64_t src1_ncols,
+        const bool bad_padding_clear) {
+    return ggml_is_quantized(src0_type) && !bad_padding_clear
+        && src1_type == GGML_TYPE_F32
+        && dst_type == GGML_TYPE_F32
+        && src1_ncols <= MMVQ_MAX_BATCH_SIZE
+        && src0_type != GGML_TYPE_TQ3_0;
+}
+
 void ggml_cuda_mul_mat_vec_q(ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst, const ggml_cuda_mm_fusion_args_host * fusion = nullptr);
 
