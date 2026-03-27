@@ -3217,45 +3217,34 @@ static __device__ __forceinline__ float tq3_0_sign_mmq(int i) {
 
 template <int mmq_y, bool need_check> static __device__ __forceinline__ void load_tiles_tq3_0(
     const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
+
+    int   * x_qs = (int   *)  x_tile;
+    float * x_df = (float *) (x_qs + WARP_SIZE);
+
     constexpr int nwarps = mmq_get_nwarps_device();
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int i0   = threadIdx.x / WARP_SIZE;
 
-#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
-    int   * x_qs = (int   *)  x_tile;
-    float * x_df = (float *) (x_tile + 2*MMQ_TILE_NE_K);
-#else
-    constexpr tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(GGML_TYPE_Q8_0, mmq_y);
-    int   * x_qs = (int   *)  x_tile;
-    float * x_df = (float *) (x_qs + txs.qs);
-#endif
-
-    const int lane = threadIdx.x;
-
-    // Pre-scaled centroids: centroid / 3.5 * 127 ≈ int8 range for N(0,1) WHT output
-    // After WHT, values are ~N(0,1). Max abs ≈ 3.5 (99.95th percentile of |N(0,1)| × sqrt(1))
-    // Fixed scale = rms * 3.5 / 127. Pre-divide centroids by 3.5 and multiply by 127.
-    static const float c8[8] = {
-        -2.1519f * (127.0f/3.5f), -1.3439f * (127.0f/3.5f),
-        -0.7560f * (127.0f/3.5f), -0.2451f * (127.0f/3.5f),
-         0.2451f * (127.0f/3.5f),  0.7560f * (127.0f/3.5f),
-         1.3439f * (127.0f/3.5f),  2.1519f * (127.0f/3.5f)
+    constexpr float tq3_centroids[8] = {
+        -2.1519f, -1.3439f, -0.7560f, -0.2451f, 0.2451f, 0.7560f, 1.3439f, 2.1519f
     };
-    const float inv_sqrt32 = 1.0f / sqrtf(32.0f);
-    const float sign = tq3_0_sign_mmq(lane);
 
-#pragma unroll
-    for (int i0 = 0; i0 < mmq_y; i0 += nwarps) {
-        int i = i0 + threadIdx.y;
-        if (need_check) { i = min(i, i_max); }
+    auto tq3_sign = [](int i) -> float {
+        return ((((unsigned)i * 0x9E3779B9u) >> 31) & 1) ? -1.0f : 1.0f;
+    };
 
-        for (int blk = 0; blk < 2; blk++) {
+    for (int i = i0; i < mmq_y; i += nwarps) {
+        if (need_check && i >= i_max) break;
+
+        for (int blk = 0; blk < 2; ++blk) {
             const block_tq3_0 * bxi = (const block_tq3_0 *)x + kbx0 + i*stride + blk;
             const float rms = __half2float(bxi->d);
 
-            // Unpack 3-bit index
+            // 1. Unpack centroid for this lane
             const int g = lane / 8, r = lane % 8;
             const uint8_t * qp = bxi->qs + g * 3;
             uint8_t idx;
-            switch (r) {
+            switch(r) {
                 case 0: idx =  qp[0]       & 7; break;
                 case 1: idx = (qp[0] >> 3) & 7; break;
                 case 2: idx = ((qp[0] >> 6) | (qp[1] << 2)) & 7; break;
@@ -3266,44 +3255,53 @@ template <int mmq_y, bool need_check> static __device__ __forceinline__ void loa
                 default: idx = (qp[2] >> 5) & 7; break;
             }
 
-            // Pre-scaled centroid (already in ~int8 range after WHT)
-            float val = c8[idx];
-
-            // WHT butterfly — 5 stages, minimal shuffles
+            // 2. WHT inverse via warp shuffle
+            float val = tq3_centroids[idx];
             #pragma unroll
             for (int step = 1; step < 32; step <<= 1) {
                 float other = __shfl_xor_sync(0xFFFFFFFF, val, step);
                 val = (lane & step) ? (other - val) : (other + val);
             }
 
-            // Apply normalize + sign + rms, clamp to int8
-            val = val * inv_sqrt32 * sign * rms;
-            int8_t qval = max(-127, min(127, (int)rintf(val)));
+            // 3. Exact dequantized float
+            float xf = val / sqrtf(32.0f) * tq3_sign(lane) * rms;
 
-            // Fixed scale (no warp reduce needed!)
-            const float scale = rms * 3.5f / 127.0f;
+            // 4. Warp reduce amax
+            float a = fabsf(xf);
+            #pragma unroll
+            for (int m = 16; m > 0; m >>= 1) {
+                a = fmaxf(a, __shfl_xor_sync(0xFFFFFFFF, a, m));
+            }
 
-            // Write int8 directly to shared memory, read back as int32
-            // Use x_qs as byte array temporarily
+            // 5. Exact q8_0 scale
+            float d  = __shfl_sync(0xFFFFFFFF, a / 127.0f, 0);
+            float id = __shfl_sync(0xFFFFFFFF, a > 0.0f ? 127.0f / a : 0.0f, 0);
+
+            // 6. Quantize
+            int q = (int)roundf(xf * id);
+            q = max(-127, min(127, q));
+            int8_t qval = (int8_t)q;
+
+            // 7. Write bytes and scale in exact q8_0 layout
             {
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
                 int8_t * x_bytes = (int8_t *)(x_qs + i*MMQ_MMA_TILE_X_K_Q8_0 + blk*MMQ_TILE_NE_K);
+                x_bytes[lane] = qval;
+                if (lane == 0) {
+                    x_df[i*MMQ_MMA_TILE_X_K_Q8_0 + blk] = d;
+                }
 #else
                 int8_t * x_bytes = (int8_t *)(x_qs + i*(2*MMQ_TILE_NE_K + 1) + blk*MMQ_TILE_NE_K);
-#endif
                 x_bytes[lane] = qval;
-            }
-
-            if (lane == 0) {
-#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
-                x_df[i*MMQ_MMA_TILE_X_K_Q8_0 + blk] = scale;
-#else
-                x_df[i*(2*MMQ_TILE_NE_K/QI8_0) + i/(QI8_0/2) + blk] = scale;
+                if (lane == 0) {
+                    x_df[i*(2*MMQ_TILE_NE_K/QI8_0) + i/(QI8_0/2) + blk] = d;
+                }
 #endif
             }
         }
     }
 }
+
 
 template <int mmq_x, int mmq_y, bool need_check, ggml_type type>
 struct mmq_type_traits;
