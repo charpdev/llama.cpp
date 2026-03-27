@@ -3210,7 +3210,11 @@ static __device__ __forceinline__ void mmq_write_back_mma(
 
 
 
-// TQ3_0: optimized dequant to q8_0 format — minimal shuffles
+// TQ3_0: optimized dequant to q8_0 format.
+// One 32-lane warp cooperatively handles one 32-value TQ3 block:
+// - one subgroup leader loads the packed 24-bit code for each 8-value subgroup
+// - all subgroup lanes extract their 3-bit code from that packed value
+// - the full 32-value inverse WHT remains exact
 static __device__ __forceinline__ float tq3_0_sign_mmq(int i) {
     return ((((unsigned)i * 0x9E3779B9u) >> 31) & 1) ? -1.0f : 1.0f;
 }
@@ -3251,22 +3255,22 @@ template <int mmq_y, bool need_check> static __device__ __forceinline__ void loa
 
         const int blk = warp % blocks_per_tile_x_row;
         const block_tq3_0 * bxi = (const block_tq3_0 *)x + kbx0 + i*stride + blk;
-        const float rms = __half2float(bxi->d);
+        const int g = lane / 8;
+        const int r = lane % 8;
+        const int leader = g * 8;
 
-        // 1. Unpack centroid for this lane.
-        const int g = lane / 8, r = lane % 8;
-        const uint8_t * qp = bxi->qs + g * 3;
-        uint8_t idx;
-        switch (r) {
-            case 0: idx =  qp[0]       & 7; break;
-            case 1: idx = (qp[0] >> 3) & 7; break;
-            case 2: idx = ((qp[0] >> 6) | (qp[1] << 2)) & 7; break;
-            case 3: idx = (qp[1] >> 1) & 7; break;
-            case 4: idx = (qp[1] >> 4) & 7; break;
-            case 5: idx = ((qp[1] >> 7) | (qp[2] << 1)) & 7; break;
-            case 6: idx = (qp[2] >> 2) & 7; break;
-            default: idx = (qp[2] >> 5) & 7; break;
+        float rms = 0.0f;
+        uint32_t packed = 0;
+        if (r == 0) {
+            rms = __half2float(bxi->d);
+            const uint8_t * qp = bxi->qs + g * 3;
+            packed = (uint32_t) qp[0] | ((uint32_t) qp[1] << 8) | ((uint32_t) qp[2] << 16);
         }
+        rms = __shfl_sync(0xFFFFFFFF, rms, leader);
+        packed = __shfl_sync(0xFFFFFFFF, packed, leader);
+
+        // 1. Unpack centroid for this lane from the subgroup's 24 packed bits.
+        const uint8_t idx = (packed >> (3 * r)) & 7;
 
         // 2. Inverse WHT for the full 32-element block.
         float val = tq3_centroids[idx];

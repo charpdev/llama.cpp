@@ -69,22 +69,19 @@ __global__ void tq3_to_q8_mmq_tile_kernel(const block_tq3_0 * tq3, uint32_t * ou
     const int blk = blockIdx.x;
 
     const block_tq3_0 * bxi = tq3 + blk;
-    const float rms = __half2float(bxi->d);
-
     const int g = lane / 8;
     const int r = lane % 8;
-    const uint8_t * qp = bxi->qs + g * 3;
-    uint8_t idx;
-    switch (r) {
-        case 0: idx =  qp[0]       & 7; break;
-        case 1: idx = (qp[0] >> 3) & 7; break;
-        case 2: idx = ((qp[0] >> 6) | (qp[1] << 2)) & 7; break;
-        case 3: idx = (qp[1] >> 1) & 7; break;
-        case 4: idx = (qp[1] >> 4) & 7; break;
-        case 5: idx = ((qp[1] >> 7) | (qp[2] << 1)) & 7; break;
-        case 6: idx = (qp[2] >> 2) & 7; break;
-        default: idx = (qp[2] >> 5) & 7; break;
+    const int leader = g * 8;
+    float rms = 0.0f;
+    uint32_t packed = 0;
+    if (r == 0) {
+        rms = __half2float(bxi->d);
+        const uint8_t * qp = bxi->qs + g * 3;
+        packed = (uint32_t) qp[0] | ((uint32_t) qp[1] << 8) | ((uint32_t) qp[2] << 16);
     }
+    rms = __shfl_sync(0xFFFFFFFF, rms, leader);
+    packed = __shfl_sync(0xFFFFFFFF, packed, leader);
+    const uint8_t idx = (packed >> (3 * r)) & 7;
 
     float val = GPU_C[idx];
     #pragma unroll
