@@ -267,6 +267,19 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
     return false;
 #endif // GGML_CUDA_FORCE_CUBLAS
 
+    // Debug/experimental knob: allow TQ3_0 to take the MMQ path for prefill-like
+    // batches on NVIDIA, while keeping decode and default policy unchanged.
+    // Set GGML_CUDA_TQ3_PREFER_MMQ_PREFILL=1 to enable.
+    static const bool tq3_prefill_mmq_env = getenv("GGML_CUDA_TQ3_PREFER_MMQ_PREFILL") != nullptr;
+    if (tq3_prefill_mmq_env &&
+        type == GGML_TYPE_TQ3_0 &&
+        GGML_CUDA_CC_IS_NVIDIA(cc) &&
+        fp16_mma_hardware_available(cc) &&
+        n_experts == 0 &&
+        ne11 >= 64) {
+        return true;
+    }
+
     // TQ3_0 currently stages through an expensive exact decode/WHT/requant bridge before
     // reaching the legacy MMQ/MMVQ q8 paths. On recent NVIDIA parts with fast tensor-core
     // fp16/bf16 GEMM, the dense cuBLAS path is faster for both prefill and decode.
