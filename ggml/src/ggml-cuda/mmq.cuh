@@ -3272,8 +3272,16 @@ template <int mmq_y, bool need_check> static __device__ __forceinline__ void loa
         // 1. Unpack centroid for this lane from the subgroup's 24 packed bits.
         const uint8_t idx = (packed >> (3 * r)) & 7;
 
-        // 2. Direct centroid * rms (activations pre-rotated, WHT not needed here)
-        const float xf = tq3_centroids[idx] * rms;
+        // 2. Inverse WHT for the full 32-element block.
+        float val = tq3_centroids[idx];
+        #pragma unroll
+        for (int step = 1; step < warp_size; step <<= 1) {
+            const float other = __shfl_xor_sync(0xFFFFFFFF, val, step);
+            val = (lane & step) ? (other - val) : (other + val);
+        }
+
+        // 3. Exact dequantized float for this lane.
+        const float xf = val / sqrtf(32.0f) * tq3_sign(lane) * rms;
 
         // 4. Exact q8_0 block scale.
         float a = fabsf(xf);

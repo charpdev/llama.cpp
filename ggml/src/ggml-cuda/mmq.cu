@@ -280,9 +280,8 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
         return true;
     }
 
-    // TQ3_0 currently stages through an expensive exact decode/WHT/requant bridge before
-    // reaching the legacy MMQ/MMVQ q8 paths. On recent NVIDIA parts with fast tensor-core
-    // fp16/bf16 GEMM, the dense cuBLAS path is faster for both prefill and decode.
+    // TQ3_0 currently uses an expensive decode/WHT/requant bridge before MMQ/MMVQ.
+    // Keep the stable dense path on NVIDIA tensor-core GPUs by default.
     if (type == GGML_TYPE_TQ3_0 && GGML_CUDA_CC_IS_NVIDIA(cc) && fp16_mma_hardware_available(cc)) {
         return false;
     }
